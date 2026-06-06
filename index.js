@@ -40,6 +40,15 @@ const FIPS_TO_STATE = {
 const INJURY_CODES = { '01': true, '02': true, '03': true, '04': true, '05': true, '06': true };
 const FATALITY_CODE = '01';
 
+// Return the column index for the first header name that exists (case-insensitive
+// names already uppercased in the idx map). Lets us tolerate MSHA naming variants.
+function col(idx, names) {
+  for (let i = 0; i < names.length; i++) {
+    if (idx[names[i]] !== undefined) return idx[names[i]];
+  }
+  return undefined;
+}
+
 // Stream a MSHA .zip, calling onLine(headerIdxMap, parts) for each data row.
 function streamZip(fileName, onHeader, onRow) {
   return new Promise((resolve, reject) => {
@@ -120,11 +129,17 @@ async function buildData() {
 
   // 2) MinesProdYearly.zip → employee-hours by year (for injury rate)
   try {
-    await streamZip('MinesProdYearly.zip', null, (idx, p) => {
-      const cm = (p[idx['COAL_METAL_IND']] || '').trim();
-      if (cm !== 'M') return;
-      const yr = parseInt((p[idx['CAL_YR']] || '0').trim(), 10);
-      const hours = parseFloat((p[idx['ANNUAL_HOURS']] || '0').trim());
+    let hCm, hYr, hHrs;
+    await streamZip('MinesProdYearly.zip', (idx) => {
+      hCm = col(idx, ['COAL_METAL_IND']);
+      hYr = col(idx, ['CAL_YR', 'CALENDAR_YR', 'PROD_CAL_YR']);
+      hHrs = col(idx, ['ANNUAL_HRS', 'ANNUAL_HOURS', 'HRS_WORKED', 'EMPLOYEE_HRS', 'EMPLOYEE_HOURS', 'HOURS_WORKED']);
+    }, (_idx, p) => {
+      // Filter to Metal/Non-Metal only if that column exists in this file.
+      if (hCm !== undefined && (p[hCm] || '').trim() !== 'M') return;
+      if (hYr === undefined || hHrs === undefined) return;
+      const yr = parseInt((p[hYr] || '0').trim(), 10);
+      const hours = parseFloat((p[hHrs] || '0').trim());
       if (!yr || !hours) return;
       hoursByYear[yr] = (hoursByYear[yr] || 0) + hours;
     });
@@ -186,6 +201,48 @@ app.get('/', async (req, res) => {
   } catch (e) {
     console.error('build error:', e);
     res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Fast diagnostic: stream just the header line of each ZIP, then abort.
+// Lets us see the real MSHA column names without a full (slow) rebuild.
+function streamHeader(fileName) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(BASE + fileName, { headers: { 'User-Agent': 'msha-service' } }, (res) => {
+      if (res.statusCode !== 200) { reject(new Error(fileName + ' HTTP ' + res.statusCode)); return; }
+      let done = false;
+      res.pipe(unzipper.Parse())
+        .on('entry', (entry) => {
+          if (done || !/\.txt$/i.test(entry.path)) { entry.autodrain(); return; }
+          let buf = '';
+          entry.on('data', (chunk) => {
+            if (done) return;
+            buf += chunk.toString('utf8');
+            const nl = buf.indexOf('\n');
+            if (nl !== -1) {
+              done = true;
+              const header = buf.slice(0, nl).replace(/\r$/, '').split('|').map((s) => s.replace(/^"|"$/g, ''));
+              try { req.destroy(); } catch (e) { /* ignore */ }
+              resolve(header);
+            }
+          });
+          entry.on('end', () => { if (!done) { done = true; resolve(buf.replace(/\r$/, '').split('|').map((s) => s.replace(/^"|"$/g, ''))); } });
+          entry.on('error', reject);
+        })
+        .on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+app.get('/headers', async (req, res) => {
+  if (SECRET && req.query.token !== SECRET) { res.status(401).json({ error: 'Invalid or missing token' }); return; }
+  try {
+    const accidents = await streamHeader('Accidents.zip');
+    const prod = await streamHeader('MinesProdYearly.zip');
+    res.json({ Accidents: accidents, MinesProdYearly: prod });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
   }
 });
 
