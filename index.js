@@ -300,9 +300,10 @@ async function buildData() {
   let latPresent = 0, latMissing = 0, latBadState = 0;
   const badSamples = [];          // examples of in-data coords that fall outside their state [diagnostic]
   try {
-    let mId, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp;
+    let mId, mCm, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp;
     await streamZip('Mines.zip', (idx) => {
       mId = col(idx, ['MINE_ID']);
+      mCm = col(idx, ['COAL_METAL_IND']);
       mName = col(idx, ['CURRENT_MINE_NAME', 'MINE_NAME']);
       mBiz = col(idx, ['CURRENT_OPERATOR_NAME', 'CURRENT_CONTROLLER_NAME', 'OPERATOR_NAME']);
       mType = col(idx, ['CURRENT_MINE_TYPE', 'MINE_TYPE']);
@@ -320,10 +321,12 @@ async function buildData() {
       if (mId === undefined) return;
       const id = (p[mId] || '').trim();
       if (!id) return;
+      const cm = mCm !== undefined ? (p[mCm] || '').trim() : '';
       let st = mSt !== undefined ? (p[mSt] || '').trim().toUpperCase() : '';
       if (/^\d+$/.test(st)) st = FIPS_TO_STATE[st.padStart(2, '0')] || '';
       const dist = mDist !== undefined ? (p[mDist] || '').trim() : '';
-      if (st.length === 2) {
+      // Citation join map — Metal/Non-Metal only (skip coal mines we never use; saves ~half the entries).
+      if ((mCm === undefined || cm === 'M') && st.length === 2) {
         mineInfo[id] = { st: st, dist: dist };
         if (dist) {
           (stateDistrictCount[st] = stateDistrictCount[st] || {});
