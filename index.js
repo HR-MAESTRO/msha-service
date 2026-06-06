@@ -55,7 +55,9 @@ function streamZip(fileName, onHeader, onRow) {
           let idx = null;
           const handleLine = (line) => {
             if (!line) return;
-            const parts = line.split('|');
+            // MSHA pipe-delimited files wrap every field in double quotes ("M"|"2024"|...).
+            // Strip the surrounding quotes from each value so filters compare against M, not "M".
+            const parts = line.split('|').map((s) => s.replace(/^"|"$/g, ''));
             if (idx === null) {
               idx = {};
               parts.forEach((h, i) => { idx[h.trim().toUpperCase().replace(/^"|"$/g, '')] = i; });
