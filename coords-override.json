@@ -1,0 +1,8 @@
+{
+  "2001887": { "lat": 46.477753, "lng": -87.455887, "source": "google", "conf": "high", "matched": "A Lindberg & Sons Inc, 480 Gravel Pit" },
+  "3200158": { "lat": 33.344763, "lng": -111.957448, "source": "google", "conf": "high", "matched": "Fisher Sand & Gravel Co" },
+  "4103181": { "lat": 35.000592, "lng": -100.884769, "source": "google", "conf": "high", "matched": "Sawyer Rock Pit" },
+  "4105858": { "lat": 30.885432, "lng": -97.706272, "source": "google", "conf": "high", "matched": "Salado Quarry" },
+  "4801906": { "lat": 41.428311, "lng": -105.222757, "source": "google", "conf": "high", "matched": "Horse Creek Quarry" },
+  "0801286": { "lat": 27.515281, "lng": -80.753726, "source": "google", "conf": "high", "matched": "Sand Hill Rock" }
+}
