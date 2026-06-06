@@ -40,6 +40,43 @@ const FIPS_TO_STATE = {
 const INJURY_CODES = { '01': true, '02': true, '03': true, '04': true, '05': true, '06': true };
 const FATALITY_CODE = '01';
 
+// ── Aggregate-industry product classification ──────────────────────────────
+// Keyed on the MSHA PRIMARY_SIC text exactly as it appears in Mines.txt (these are
+// the same strings the dashboard already used when the data was pulled manually).
+// segment 'construction_aggregate' feeds the Safety "aggregates" filter; segment
+// 'industrial_sand' rides along in the location roster but is EXCLUDED from safety.
+const PRODUCT_SEGMENT = {
+  'crushed, broken limestone nec': 'construction_aggregate',
+  'crushed, broken marble': 'construction_aggregate',
+  'construction sand and gravel': 'construction_aggregate',
+  'crushed, broken granite': 'construction_aggregate',
+  'crushed, broken sandstone': 'construction_aggregate',
+  'crushed, broken slate': 'construction_aggregate',
+  'crushed, broken stone nec': 'construction_aggregate',
+  'crushed, broken quartzite': 'construction_aggregate',
+  'sand, common': 'construction_aggregate',
+  'crushed, broken traprock': 'construction_aggregate',
+  'crushed, broken mica': 'construction_aggregate',
+  'crushed, broken basalt': 'construction_aggregate',
+  'sand, industrial nec': 'industrial_sand',
+  'sand, industrial': 'industrial_sand'
+};
+function normKey(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+function productSegment(s) { return PRODUCT_SEGMENT[normKey(s)] || null; }
+
+// MSHA statuses kept in the location roster (the "all listed" set the user wants).
+// Abandoned / Closed-By-MSHA are excluded. Matched on a punctuation/space-stripped
+// lowercase key to tolerate spelling variants (e.g. "Non-Producing" vs "NonProducing").
+const ROSTER_STATUS = {
+  'active': 'Active',
+  'intermittent': 'Intermittent',
+  'temporarilyidled': 'Temporarily Idled',
+  'nonproducing': 'NonProducing',
+  'newmine': 'New Mine'
+};
+function statusKey(s) { return String(s || '').toLowerCase().replace(/[^a-z]/g, ''); }
+function rosterStatus(s) { return ROSTER_STATUS[statusKey(s)] || null; }
+
 // Return the column index for the first header name that exists (case-insensitive
 // names already uppercased in the idx map). Lets us tolerate MSHA naming variants.
 function col(idx, names) {
@@ -399,11 +436,61 @@ function streamHeader(fileName) {
 app.get('/headers', async (req, res) => {
   if (SECRET && req.query.token !== SECRET) { res.status(401).json({ error: 'Invalid or missing token' }); return; }
   try {
-    const accidents = await streamHeader('Accidents.zip');
-    const prod = await streamHeader('MinesProdYearly.zip');
-    const violations = await streamHeader('Violations.zip');
-    const mines = await streamHeader('Mines.zip');
-    res.json({ Accidents: accidents, MinesProdYearly: prod, Violations: violations, Mines: mines });
+    const out = {};
+    const files = ['Accidents.zip', 'MinesProdYearly.zip', 'Violations.zip', 'Mines.zip', 'AddressOfRecord.zip'];
+    for (const f of files) {
+      try { out[f.replace('.zip', '')] = await streamHeader(f); }
+      catch (e) { out[f.replace('.zip', '')] = 'ERROR: ' + ((e && e.message) || e); }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
+});
+
+// Diagnostic: return the first N data rows of a file as {column: value} objects, so
+// we can see the REAL status/product/lat-long/address spellings before wiring parsing.
+// Usage: /sample?token=...&file=Mines.zip&n=3
+function streamSample(fileName, n) {
+  return new Promise((resolve, reject) => {
+    const rows = [];
+    let idx = null, header = null, count = 0, done = false;
+    const req = https.get(BASE + fileName, { headers: { 'User-Agent': 'msha-service' } }, (res) => {
+      if (res.statusCode !== 200) { reject(new Error(fileName + ' HTTP ' + res.statusCode)); return; }
+      res.pipe(unzipper.Parse())
+        .on('entry', (entry) => {
+          if (done || !/\.txt$/i.test(entry.path)) { entry.autodrain(); return; }
+          let leftover = '';
+          const handle = (line) => {
+            if (done || !line) return;
+            const parts = line.split('|').map((s) => s.replace(/^"|"$/g, ''));
+            if (idx === null) { idx = parts.map((h) => h.trim()); header = idx; return; }
+            const obj = {};
+            header.forEach((h, i) => { obj[h] = parts[i]; });
+            rows.push(obj);
+            if (++count >= n) { done = true; try { req.destroy(); } catch (e) {} resolve({ columns: header, rows: rows }); }
+          };
+          entry.on('data', (chunk) => {
+            if (done) return;
+            const text = leftover + chunk.toString('utf8');
+            const ls = text.split('\n'); leftover = ls.pop();
+            for (const l of ls) handle(l.replace(/\r$/, ''));
+          });
+          entry.on('end', () => { if (!done) { resolve({ columns: header, rows: rows }); } });
+          entry.on('error', reject);
+        })
+        .on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+app.get('/sample', async (req, res) => {
+  if (SECRET && req.query.token !== SECRET) { res.status(401).json({ error: 'Invalid or missing token' }); return; }
+  const file = (req.query.file || 'Mines.zip').replace(/[^A-Za-z0-9._-]/g, '');
+  const n = Math.min(parseInt(req.query.n, 10) || 3, 20);
+  try {
+    res.json(await streamSample(file, n));
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
