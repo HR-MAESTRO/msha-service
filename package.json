@@ -1,0 +1,12 @@
+{
+  "name": "msha-service",
+  "version": "1.0.0",
+  "description": "Streams + filters + aggregates the MSHA Open-Gov ZIP files into compact JSON for the NSSGA dashboard (Apps Script can't unzip the >100MB Accidents.txt).",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "unzipper": "^0.12.3"
+  }
+}
