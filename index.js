@@ -49,6 +49,38 @@ function col(idx, names) {
   return undefined;
 }
 
+// Degree-of-injury code → readable severity label (MSHA standard codes).
+const DEGREE_LABELS = {
+  '01': 'Fatality',
+  '02': 'Permanent Disability',
+  '03': 'Days Away From Work',
+  '04': 'Days Away & Restricted',
+  '05': 'Restricted Duty Only',
+  '06': 'No Lost Time (Medical)',
+  '07': 'Occupational Illness'
+};
+
+// Human labels for the most-cited 30 CFR Metal/Non-Metal standards; fallback to the raw section.
+const CFR_DESCR = {
+  '56.14107': 'Moving machine parts — guarding',
+  '56.12028': 'Continuity & resistance of grounding',
+  '56.18010': 'First aid availability',
+  '56.14100': 'Safety defects — exam & correction',
+  '56.20003': 'Housekeeping at workplaces',
+  '56.14132': 'Backup alarms / horns',
+  '56.4101': 'Warning signs — flammable/combustible',
+  '56.14112': 'Construction & maintenance of guards',
+  '56.11001': 'Safe access to working places',
+  '56.12032': 'Inspection & cover plates (electrical)',
+  '56.14130': 'ROPS & seat belts',
+  '56.9300': 'Berms or guardrails on roadways',
+  '56.3200': 'Correction of hazardous ground conditions',
+  '56.15005': 'Safety belts and lines',
+  '56.14101': 'Brakes — self-propelled equipment',
+  '56.14200': 'Warning before equipment is moved',
+  '47.41': 'HazCom — container labeling'
+};
+
 // Stream a MSHA .zip, calling onLine(headerIdxMap, parts) for each data row.
 function streamZip(fileName, onHeader, onRow) {
   return new Promise((resolve, reject) => {
@@ -99,6 +131,10 @@ async function buildData() {
   const causeBySubunit = {};
   const stateData = {};
   const hoursByYear = {};
+  // Injuries-page breakdowns (non-fatal reportable injuries, last 10 yrs)
+  const injSeverity = {};
+  const injCause = {};
+  const injOp = { Facility: 0, Surface: 0, Underground: 0 };
 
   // 1) Accidents.zip → fatalities, injuries, causes, state breakdown
   await streamZip('Accidents.zip', null, (idx, p) => {
@@ -111,6 +147,9 @@ async function buildData() {
     const sub = (p[idx['SUBUNIT']] || '').trim().toLowerCase();
     const st = (p[idx['FIPS_STATE_CD']] || '').trim();
 
+    const isUG = sub.indexOf('underground') !== -1;
+    const isFacility = sub.indexOf('facility') !== -1 || sub.indexOf('mill') !== -1 || sub.indexOf('shop') !== -1 || sub.indexOf('office') !== -1;
+
     if (deg === FATALITY_CODE) {
       fatalByYear[yr] = (fatalByYear[yr] || 0) + 1;
       if (st) { (stateData[st] = stateData[st] || { fatalities: 0, injuries: 0 }).fatalities++; }
@@ -119,11 +158,20 @@ async function buildData() {
       injuryByYear[yr] = (injuryByYear[yr] || 0) + 1;
       if (st) { (stateData[st] = stateData[st] || { fatalities: 0, injuries: 0 }).injuries++; }
     }
+
     if (yr >= tenYrStart) {
-      const c = causeBySubunit[cls] || (causeBySubunit[cls] = { Cause: cls, Fac: 0, Surf: 0, UG: 0 });
-      if (sub.indexOf('facility') !== -1 || sub.indexOf('mill') !== -1 || sub.indexOf('shop') !== -1 || sub.indexOf('office') !== -1) c.Fac++;
-      else if (sub.indexOf('underground') !== -1) c.UG++;
-      else c.Surf++;
+      // Fatalities-by-cause pies (fatalities only — these feed the Fatalities page)
+      if (deg === FATALITY_CODE) {
+        const c = causeBySubunit[cls] || (causeBySubunit[cls] = { Cause: cls, Fac: 0, Surf: 0, UG: 0 });
+        if (isFacility) c.Fac++; else if (isUG) c.UG++; else c.Surf++;
+      }
+      // Injury breakdowns (non-fatal reportable injuries — these feed the Injuries page)
+      if (deg !== FATALITY_CODE && (INJURY_CODES[deg] || deg === '07')) {
+        const sev = DEGREE_LABELS[deg] || 'Other';
+        injSeverity[sev] = (injSeverity[sev] || 0) + 1;
+        injCause[cls] = (injCause[cls] || 0) + 1;
+        if (isFacility) injOp.Facility++; else if (isUG) injOp.Underground++; else injOp.Surface++;
+      }
     }
   });
 
@@ -145,6 +193,47 @@ async function buildData() {
     });
   } catch (e) {
     console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
+  }
+
+  // 3) Violations.zip → top CFR sections (last 3 yrs) + citations by state & year
+  const citByStateYear = {};   // { fips: { year: count } }
+  const cfrAgg = {};           // { section: { count, ss } } — last 3 yrs
+  const violYears = {};        // set of years seen
+  try {
+    let vCm, vYr, vCfr, vSS, vSt;
+    const threeYrStart = currentYear - 3;
+    await streamZip('Violations.zip', (idx) => {
+      vCm = col(idx, ['COAL_METAL_IND']);
+      vYr = col(idx, ['CAL_YR', 'VIOLATION_ISSUE_YR']);
+      vCfr = col(idx, ['CFR_STANDARD', 'SECTION_OF_ACT', 'STANDARD', 'CFR_STANDARD_CD']);
+      vSS = col(idx, ['SIG_SUB', 'SIG_AND_SUB', 'S_AND_S', 'SS_IND']);
+      vSt = col(idx, ['FIPS_STATE_CD', 'STATE_FIPS_CD']);
+    }, (_idx, p) => {
+      if (vCm !== undefined && (p[vCm] || '').trim() !== 'M') return;
+      if (vYr === undefined) return;
+      const yr = parseInt((p[vYr] || '0').trim(), 10);
+      if (!yr) return;
+      // citations by state & year (full slider range)
+      if (vSt !== undefined) {
+        const st = (p[vSt] || '').trim();
+        if (st) {
+          (citByStateYear[st] = citByStateYear[st] || {});
+          citByStateYear[st][yr] = (citByStateYear[st][yr] || 0) + 1;
+          violYears[yr] = true;
+        }
+      }
+      // top CFR sections — last 3 yrs only
+      if (yr >= threeYrStart && vCfr !== undefined) {
+        const sec = (p[vCfr] || '').trim();
+        if (sec) {
+          const a = cfrAgg[sec] || (cfrAgg[sec] = { count: 0, ss: 0 });
+          a.count++;
+          if (vSS !== undefined && (p[vSS] || '').trim().toUpperCase() === 'Y') a.ss++;
+        }
+      }
+    });
+  } catch (e) {
+    console.warn('Violations failed (citations unavailable):', e.message);
   }
 
   const allFatalities = Object.keys(fatalByYear).map(Number).sort((a, b) => a - b)
@@ -170,9 +259,46 @@ async function buildData() {
     if (abbr) stateByAbbr[abbr] = stateData[fips];
   });
 
+  // Injuries-page payload
+  const injuries = {
+    byYear: Object.keys(injuryByYear).map(Number).sort((a, b) => a - b)
+      .map((yr) => ({ Year: yr, Count: injuryByYear[yr] })),
+    bySeverity: Object.keys(injSeverity).map((k) => ({ label: k, count: injSeverity[k] }))
+      .sort((a, b) => b.count - a.count),
+    byCause: Object.keys(injCause).map((k) => ({ label: k, count: injCause[k] }))
+      .sort((a, b) => b.count - a.count).slice(0, 10),
+    byOperation: Object.keys(injOp).map((k) => ({ label: k, count: injOp[k] }))
+      .filter((o) => o.count > 0)
+  };
+
+  // Citations-page payload
+  const topViolations = Object.keys(cfrAgg).map((sec) => {
+    const a = cfrAgg[sec];
+    const base = sec.split(/[()]/)[0];
+    return {
+      section: sec,
+      description: CFR_DESCR[sec] || CFR_DESCR[base] || ('30 CFR §' + sec),
+      count: a.count,
+      ssCount: a.ss,
+      typicallySS: a.ss > a.count / 2
+    };
+  }).sort((x, y) => y.count - x.count).slice(0, 15).map((v, i) => ({ ...v, rank: i + 1 }));
+
+  const citByAbbr = {};
+  Object.keys(citByStateYear).forEach((fips) => {
+    const abbr = FIPS_TO_STATE[fips];
+    if (abbr) citByAbbr[abbr] = citByStateYear[fips];
+  });
+  const violations = {
+    topViolations,
+    byStateYear: citByAbbr,
+    years: Object.keys(violYears).map(Number).sort((a, b) => a - b)
+  };
+
   return {
     allFatalities, tenYrCauses, injuryRate,
     stateData: stateByAbbr,
+    injuries, violations,
     lastUpdated: new Date().toISOString()
   };
 }
@@ -240,7 +366,8 @@ app.get('/headers', async (req, res) => {
   try {
     const accidents = await streamHeader('Accidents.zip');
     const prod = await streamHeader('MinesProdYearly.zip');
-    res.json({ Accidents: accidents, MinesProdYearly: prod });
+    const violations = await streamHeader('Violations.zip');
+    res.json({ Accidents: accidents, MinesProdYearly: prod, Violations: violations });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
