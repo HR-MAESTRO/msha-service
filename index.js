@@ -195,38 +195,55 @@ async function buildData() {
     console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
   }
 
-  // 3) Violations.zip → top CFR sections (last 3 yrs) + citations by state & year
-  const citByStateYear = {};   // { fips: { year: count } }
-  const cfrAgg = {};           // { section: { count, ss } } — last 3 yrs
+  // 3a) Mines.zip → MINE_ID → state-abbr map (Violations has no state column, so we join on MINE_ID)
+  const mineState = {};
+  try {
+    let mId, mSt;
+    await streamZip('Mines.zip', (idx) => {
+      mId = col(idx, ['MINE_ID']);
+      mSt = col(idx, ['STATE', 'STATE_ABBR', 'STATE_CD', 'MINE_STATE']);
+    }, (_idx, p) => {
+      if (mId === undefined || mSt === undefined) return;
+      const id = (p[mId] || '').trim();
+      let st = (p[mSt] || '').trim().toUpperCase();
+      if (/^\d+$/.test(st)) st = FIPS_TO_STATE[st.padStart(2, '0')] || ''; // tolerate FIPS instead of abbr
+      if (id && st.length === 2) mineState[id] = st;
+    });
+  } catch (e) {
+    console.warn('Mines failed (citation state map unavailable):', e.message);
+  }
+
+  // 3b) Violations.zip → top CFR sections (last 3 yrs) + citations by state & year (joined via Mines)
+  const citByStateYear = {};   // { stateAbbr: { year: count } }
+  const cfrAgg = {};           // { baseSection: { count, ss } } — last 3 yrs
   const violYears = {};        // set of years seen
   try {
-    let vCm, vYr, vCfr, vSS, vSt;
+    let vCm, vYr, vCfr, vSS, vMine;
     const threeYrStart = currentYear - 3;
     await streamZip('Violations.zip', (idx) => {
       vCm = col(idx, ['COAL_METAL_IND']);
       vYr = col(idx, ['CAL_YR', 'VIOLATION_ISSUE_YR']);
-      vCfr = col(idx, ['CFR_STANDARD', 'SECTION_OF_ACT', 'STANDARD', 'CFR_STANDARD_CD']);
-      vSS = col(idx, ['SIG_SUB', 'SIG_AND_SUB', 'S_AND_S', 'SS_IND']);
-      vSt = col(idx, ['FIPS_STATE_CD', 'STATE_FIPS_CD']);
+      vCfr = col(idx, ['SECTION_OF_ACT', 'PART_SECTION', 'CFR_STANDARD']);
+      vSS = col(idx, ['SIG_SUB', 'SIG_AND_SUB', 'S_AND_S']);
+      vMine = col(idx, ['MINE_ID']);
     }, (_idx, p) => {
       if (vCm !== undefined && (p[vCm] || '').trim() !== 'M') return;
       if (vYr === undefined) return;
       const yr = parseInt((p[vYr] || '0').trim(), 10);
       if (!yr) return;
-      // citations by state & year (full slider range)
-      if (vSt !== undefined) {
-        const st = (p[vSt] || '').trim();
-        if (st) {
-          (citByStateYear[st] = citByStateYear[st] || {});
-          citByStateYear[st][yr] = (citByStateYear[st][yr] || 0) + 1;
-          violYears[yr] = true;
-        }
+      // citations by state & year (join MINE_ID → Mines state) — full range for the slider
+      const abbr = vMine !== undefined && mineState[(p[vMine] || '').trim()];
+      if (abbr) {
+        (citByStateYear[abbr] = citByStateYear[abbr] || {});
+        citByStateYear[abbr][yr] = (citByStateYear[abbr][yr] || 0) + 1;
+        violYears[yr] = true;
       }
-      // top CFR sections — last 3 yrs only
+      // top CFR sections — last 3 yrs only, normalized to base section (56.14107(a) → 56.14107)
       if (yr >= threeYrStart && vCfr !== undefined) {
-        const sec = (p[vCfr] || '').trim();
-        if (sec) {
-          const a = cfrAgg[sec] || (cfrAgg[sec] = { count: 0, ss: 0 });
+        const m = (p[vCfr] || '').trim().match(/^\d+\.\d+/);
+        if (m) {
+          const base = m[0];
+          const a = cfrAgg[base] || (cfrAgg[base] = { count: 0, ss: 0 });
           a.count++;
           if (vSS !== undefined && (p[vSS] || '').trim().toUpperCase() === 'Y') a.ss++;
         }
@@ -271,27 +288,21 @@ async function buildData() {
       .filter((o) => o.count > 0)
   };
 
-  // Citations-page payload
+  // Citations-page payload (cfrAgg keys are already base sections; citByStateYear already abbr-keyed)
   const topViolations = Object.keys(cfrAgg).map((sec) => {
     const a = cfrAgg[sec];
-    const base = sec.split(/[()]/)[0];
     return {
       section: sec,
-      description: CFR_DESCR[sec] || CFR_DESCR[base] || ('30 CFR §' + sec),
+      description: CFR_DESCR[sec] || ('30 CFR §' + sec),
       count: a.count,
       ssCount: a.ss,
       typicallySS: a.ss > a.count / 2
     };
   }).sort((x, y) => y.count - x.count).slice(0, 15).map((v, i) => ({ ...v, rank: i + 1 }));
 
-  const citByAbbr = {};
-  Object.keys(citByStateYear).forEach((fips) => {
-    const abbr = FIPS_TO_STATE[fips];
-    if (abbr) citByAbbr[abbr] = citByStateYear[fips];
-  });
   const violations = {
     topViolations,
-    byStateYear: citByAbbr,
+    byStateYear: citByStateYear,
     years: Object.keys(violYears).map(Number).sort((a, b) => a - b)
   };
 
@@ -367,7 +378,8 @@ app.get('/headers', async (req, res) => {
     const accidents = await streamHeader('Accidents.zip');
     const prod = await streamHeader('MinesProdYearly.zip');
     const violations = await streamHeader('Violations.zip');
-    res.json({ Accidents: accidents, MinesProdYearly: prod, Violations: violations });
+    const mines = await streamHeader('Mines.zip');
+    res.json({ Accidents: accidents, MinesProdYearly: prod, Violations: violations, Mines: mines });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
