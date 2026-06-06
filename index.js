@@ -301,10 +301,18 @@ function finalizeViol(acc, stateDistrict) {
   };
 }
 
+// Split a construction-aggregate product into the two USGS commodities the State_Data
+// sheet tracks: 'crushedStone' ("Stone, crushed") vs 'sandGravel' ("Sand and gravel").
+function commodityOf(product) {
+  const k = normKey(product);
+  return (k.indexOf('sand') !== -1 || k.indexOf('gravel') !== -1) ? 'sandGravel' : 'crushedStone';
+}
+
 async function buildData() {
   const currentYear = new Date().getFullYear();
   const tenYrStart = currentYear - 10;
   const threeYrStart = currentYear - 3;
+  const prodRecentYr = currentYear - 4;   // keep only recent MinesProdYearly hours for the production rollup
 
   // ── 1) Mines.zip FIRST — builds the location roster, the MINE_ID→{state,district}
   //       join map (for citations), and the aggregate MINE_ID set (for safety). ──
@@ -316,14 +324,16 @@ async function buildData() {
   const statusCounts = {};        // raw status -> count over all mines [diagnostic]
   let latPresent = 0, latMissing = 0, latBadState = 0, latBadNonPortable = 0, latNoUSState = 0;
   const badSamples = [];          // actionable bad coords (non-portable or off-continent) [diagnostic]
+  const prodInfo = {};            // MINE_ID -> { ctrl, comm, st } for construction-aggregate mines (membership/production rollup)
   try {
-    let mId, mCm, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp, mPort;
+    let mId, mCm, mName, mBiz, mCtrl, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp, mPort;
     await streamZip('Mines.zip', (idx) => {
       mId = col(idx, ['MINE_ID']);
       mCm = col(idx, ['COAL_METAL_IND']);
       mPort = col(idx, ['PORTABLE_OPERATION']);
       mName = col(idx, ['CURRENT_MINE_NAME', 'MINE_NAME']);
       mBiz = col(idx, ['CURRENT_OPERATOR_NAME', 'CURRENT_CONTROLLER_NAME', 'OPERATOR_NAME']);
+      mCtrl = col(idx, ['CURRENT_CONTROLLER_NAME', 'CONTROLLER_NAME', 'CURRENT_CONTROLLER']);
       mType = col(idx, ['CURRENT_MINE_TYPE', 'MINE_TYPE']);
       mStatus = col(idx, ['CURRENT_MINE_STATUS', 'MINE_STATUS']);
       mSt = col(idx, ['STATE', 'STATE_ABBR', 'STATE_CD', 'MINE_STATE']);
@@ -354,7 +364,13 @@ async function buildData() {
 
       const product = mProd !== undefined ? (p[mProd] || '').trim() : '';
       const seg = productSegment(product);
-      if (seg === 'construction_aggregate') aggMineIds.add(id);
+      if (seg === 'construction_aggregate') {
+        aggMineIds.add(id);
+        // Membership/production rollup: parent (controller) + commodity + state, all statuses.
+        const ctrl = (mCtrl !== undefined ? (p[mCtrl] || '').trim() : '') ||
+          (mBiz !== undefined ? (p[mBiz] || '').trim() : '') || '(Unknown controller)';
+        if (st.length === 2) prodInfo[id] = { ctrl: ctrl, comm: commodityOf(product), st: st };
+      }
 
       const status = mStatus !== undefined ? (p[mStatus] || '').trim() : '';
       statusCounts[status] = (statusCounts[status] || 0) + 1;
@@ -490,6 +506,7 @@ async function buildData() {
 
   // ── 4) MinesProdYearly.zip → employee-hours by year (M/NM + aggregates, joined on MINE_ID) ──
   const mnmHours = {}, aggHours = {};
+  const prodHoursById = {};   // MINE_ID -> { year: hours } (recent years, aggregate mines only)
   try {
     let hCm, hYr, hHrs, hId;
     await streamZip('MinesProdYearly.zip', (idx) => {
@@ -505,11 +522,51 @@ async function buildData() {
       const cm = hCm !== undefined ? (p[hCm] || '').trim() : '';
       if (cm === 'M') mnmHours[yr] = (mnmHours[yr] || 0) + hours;
       const id = hId !== undefined ? (p[hId] || '').trim() : '';
-      if (id && aggMineIds.has(id)) aggHours[yr] = (aggHours[yr] || 0) + hours;
+      if (id && aggMineIds.has(id)) {
+        aggHours[yr] = (aggHours[yr] || 0) + hours;
+        if (prodInfo[id] && yr >= prodRecentYr) {
+          (prodHoursById[id] = prodHoursById[id] || {});
+          prodHoursById[id][yr] = (prodHoursById[id][yr] || 0) + hours;
+        }
+      }
     });
   } catch (e) {
     console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
   }
+
+  // ── Production/membership rollup: parent (controller) employee-hours by state × commodity. ──
+  // Allocator only — the dashboard combines these shares with USGS State_Data $ to estimate sales.
+  // Each mine contributes its most-recent available year's hours (within the recent window).
+  const controllerAgg = {};   // ctrlKey -> { name, mineCount, states:{}, hbsc:{ st:{crushedStone,sandGravel} } }
+  const stateCommHours = {};  // st -> { crushedStone, sandGravel } (denominators for share allocation)
+  let prodYearMax = 0;
+  Object.keys(prodInfo).forEach((id) => {
+    const info = prodInfo[id];
+    const hrsObj = prodHoursById[id];
+    let hrs = 0;
+    if (hrsObj) {
+      const yrs = Object.keys(hrsObj).map(Number).sort((a, b) => b - a);
+      if (yrs.length) { hrs = hrsObj[yrs[0]]; if (yrs[0] > prodYearMax) prodYearMax = yrs[0]; }
+    }
+    const key = info.ctrl.toUpperCase();
+    const c = controllerAgg[key] || (controllerAgg[key] = { name: info.ctrl, mineCount: 0, states: {}, hbsc: {} });
+    c.mineCount++;
+    c.states[info.st] = true;
+    if (hrs > 0) {
+      (c.hbsc[info.st] = c.hbsc[info.st] || { crushedStone: 0, sandGravel: 0 });
+      c.hbsc[info.st][info.comm] += hrs;
+      (stateCommHours[info.st] = stateCommHours[info.st] || { crushedStone: 0, sandGravel: 0 });
+      stateCommHours[info.st][info.comm] += hrs;
+    }
+  });
+  const production = {
+    year: prodYearMax,
+    stateCommHours: stateCommHours,
+    controllers: Object.keys(controllerAgg).map((k) => {
+      const c = controllerAgg[k];
+      return { controller: c.name, mineCount: c.mineCount, states: Object.keys(c.states), hoursByStateComm: c.hbsc };
+    })
+  };
 
   // ── 5) Violations.zip → top CFR + citations, M/NM AND aggregates-only ──
   const mnmViol = newViolAcc(), aggViol = newViolAcc();
@@ -571,6 +628,8 @@ async function buildData() {
     roster: roster,
     operationsByState: operationsByState,
     employmentByState: employmentByState,
+    // Parent-company employee-hours by state×commodity (served via /production).
+    production: production,
     diagnostics: {
       rosterCount: roster.length,
       aggMineIdCount: aggMineIds.size,
@@ -615,6 +674,10 @@ function minesSlice(d) {
     diagnostics: d.diagnostics, lastUpdated: d.lastUpdated
   };
 }
+// Production payload — parent-company hours by state×commodity (membership targeting).
+function productionSlice(d) {
+  return { production: d.production, lastUpdated: d.lastUpdated };
+}
 
 const app = express();
 
@@ -641,6 +704,18 @@ app.get('/mines', async (req, res) => {
   try {
     const d = await getData(req.query.fresh === '1');
     res.json(minesSlice(d));
+  } catch (e) {
+    console.error('build error:', e);
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Parent-company production rollup (hours by state×commodity) for membership targeting.
+app.get('/production', async (req, res) => {
+  if (SECRET && req.query.token !== SECRET) { res.status(401).json({ error: 'Invalid or missing token' }); return; }
+  try {
+    const d = await getData(req.query.fresh === '1');
+    res.json(productionSlice(d));
   } catch (e) {
     console.error('build error:', e);
     res.status(500).json({ error: String(e && e.message || e) });
