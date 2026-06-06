@@ -195,28 +195,44 @@ async function buildData() {
     console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
   }
 
-  // 3a) Mines.zip → MINE_ID → state-abbr map (Violations has no state column, so we join on MINE_ID)
-  const mineState = {};
+  // 3a) Mines.zip → MINE_ID → { state, district } (Violations has no state/district column, so we join on MINE_ID)
+  const mineInfo = {};            // MINE_ID -> { st, dist }
+  const stateDistrictCount = {};  // st -> { dist -> count }  (to derive the dominant district per state)
   try {
-    let mId, mSt;
+    let mId, mSt, mDist;
     await streamZip('Mines.zip', (idx) => {
       mId = col(idx, ['MINE_ID']);
       mSt = col(idx, ['STATE', 'STATE_ABBR', 'STATE_CD', 'MINE_STATE']);
+      mDist = col(idx, ['DISTRICT', 'MSHA_DISTRICT', 'DIST']);
     }, (_idx, p) => {
       if (mId === undefined || mSt === undefined) return;
       const id = (p[mId] || '').trim();
       let st = (p[mSt] || '').trim().toUpperCase();
       if (/^\d+$/.test(st)) st = FIPS_TO_STATE[st.padStart(2, '0')] || ''; // tolerate FIPS instead of abbr
-      if (id && st.length === 2) mineState[id] = st;
+      const dist = mDist !== undefined ? (p[mDist] || '').trim() : '';
+      if (id && st.length === 2) {
+        mineInfo[id] = { st: st, dist: dist };
+        if (dist) {
+          (stateDistrictCount[st] = stateDistrictCount[st] || {});
+          stateDistrictCount[st][dist] = (stateDistrictCount[st][dist] || 0) + 1;
+        }
+      }
     });
   } catch (e) {
     console.warn('Mines failed (citation state map unavailable):', e.message);
   }
+  // Dominant MSHA district per state (for coloring/labeling the citation map)
+  const stateDistrict = {};
+  Object.keys(stateDistrictCount).forEach((st) => {
+    const m = stateDistrictCount[st];
+    stateDistrict[st] = Object.keys(m).sort((a, b) => m[b] - m[a])[0];
+  });
 
-  // 3b) Violations.zip → top CFR sections (last 3 yrs) + citations by state & year (joined via Mines)
-  const citByStateYear = {};   // { stateAbbr: { year: count } }
-  const cfrAgg = {};           // { baseSection: { count, ss } } — last 3 yrs
-  const violYears = {};        // set of years seen
+  // 3b) Violations.zip → top CFR sections (last 3 yrs) + citations by state/district & year (joined via Mines)
+  const citByStateYear = {};    // { stateAbbr: { year: count } }
+  const citByDistrictYear = {}; // { district: { year: count } }
+  const cfrAgg = {};            // { baseSection: { count, ss } } — last 3 yrs
+  const violYears = {};         // set of years seen
   try {
     let vCm, vYr, vCfr, vSS, vMine;
     const threeYrStart = currentYear - 3;
@@ -231,12 +247,18 @@ async function buildData() {
       if (vYr === undefined) return;
       const yr = parseInt((p[vYr] || '0').trim(), 10);
       if (!yr) return;
-      // citations by state & year (join MINE_ID → Mines state) — full range for the slider
-      const abbr = vMine !== undefined && mineState[(p[vMine] || '').trim()];
-      if (abbr) {
-        (citByStateYear[abbr] = citByStateYear[abbr] || {});
-        citByStateYear[abbr][yr] = (citByStateYear[abbr][yr] || 0) + 1;
-        violYears[yr] = true;
+      // citations by state/district & year (join MINE_ID → Mines) — full range for the slider
+      const info = vMine !== undefined && mineInfo[(p[vMine] || '').trim()];
+      if (info) {
+        if (info.st) {
+          (citByStateYear[info.st] = citByStateYear[info.st] || {});
+          citByStateYear[info.st][yr] = (citByStateYear[info.st][yr] || 0) + 1;
+          violYears[yr] = true;
+        }
+        if (info.dist) {
+          (citByDistrictYear[info.dist] = citByDistrictYear[info.dist] || {});
+          citByDistrictYear[info.dist][yr] = (citByDistrictYear[info.dist][yr] || 0) + 1;
+        }
       }
       // top CFR sections — last 3 yrs only, normalized to base section (56.14107(a) → 56.14107)
       if (yr >= threeYrStart && vCfr !== undefined) {
@@ -303,6 +325,8 @@ async function buildData() {
   const violations = {
     topViolations,
     byStateYear: citByStateYear,
+    byDistrictYear: citByDistrictYear,
+    stateDistrict: stateDistrict,
     years: Object.keys(violYears).map(Number).sort((a, b) => a - b)
   };
 
