@@ -23,10 +23,19 @@
 
 const express = require('express');
 const https = require('https');
+const fs = require('fs');
 const unzipper = require('unzipper');
 
 const BASE = 'https://arlweb.msha.gov/OpenGovernmentData/DataSets/';
 const SECRET = process.env.SECRET || '';
+
+// Optional coordinate corrections produced by the one-time geocode.js enrichment job
+// (MINE_ID -> { lat, lng, source }). Absent on first deploy; applied to the roster once present.
+let COORDS_OVERRIDE = {};
+try {
+  COORDS_OVERRIDE = JSON.parse(fs.readFileSync(__dirname + '/coords-override.json', 'utf8'));
+  console.log('Loaded coords-override.json:', Object.keys(COORDS_OVERRIDE).length, 'entries');
+} catch (e) { /* no override file yet — fine */ }
 
 const FIPS_TO_STATE = {
   '01': 'AL', '02': 'AK', '04': 'AZ', '05': 'AR', '06': 'CA', '08': 'CO', '09': 'CT', '10': 'DE',
@@ -62,6 +71,14 @@ function inBbox(st, lat, lng) {
   const b = STATE_BBOX[st];
   if (!b) return true; // unknown state (e.g. PR) — can't validate, don't flag
   return lat >= b[0] && lat <= b[1] && lng >= b[2] && lng <= b[3];
+}
+// Which state's bbox contains this point (first match) — '' if none (ocean/foreign/null-island).
+function guessState(lat, lng) {
+  for (const s in STATE_BBOX) {
+    const b = STATE_BBOX[s];
+    if (lat >= b[0] && lat <= b[1] && lng >= b[2] && lng <= b[3]) return s;
+  }
+  return '';
 }
 
 const INJURY_CODES = { '01': true, '02': true, '03': true, '04': true, '05': true, '06': true };
@@ -297,13 +314,14 @@ async function buildData() {
   const roster = [];              // location roster (status-filtered, aggregate + industrial sand)
   const productCounts = {};       // raw PRIMARY_SIC -> count over roster [diagnostic]
   const statusCounts = {};        // raw status -> count over all mines [diagnostic]
-  let latPresent = 0, latMissing = 0, latBadState = 0;
-  const badSamples = [];          // examples of in-data coords that fall outside their state [diagnostic]
+  let latPresent = 0, latMissing = 0, latBadState = 0, latBadNonPortable = 0, latNoUSState = 0;
+  const badSamples = [];          // actionable bad coords (non-portable or off-continent) [diagnostic]
   try {
-    let mId, mCm, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp;
+    let mId, mCm, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp, mPort;
     await streamZip('Mines.zip', (idx) => {
       mId = col(idx, ['MINE_ID']);
       mCm = col(idx, ['COAL_METAL_IND']);
+      mPort = col(idx, ['PORTABLE_OPERATION']);
       mName = col(idx, ['CURRENT_MINE_NAME', 'MINE_NAME']);
       mBiz = col(idx, ['CURRENT_OPERATOR_NAME', 'CURRENT_CONTROLLER_NAME', 'OPERATOR_NAME']);
       mType = col(idx, ['CURRENT_MINE_TYPE', 'MINE_TYPE']);
@@ -344,14 +362,28 @@ async function buildData() {
       // Roster = aggregate OR industrial sand, in one of the kept statuses.
       if (rs && seg) {
         productCounts[product] = (productCounts[product] || 0) + 1;
-        const lat = parseFloat((mLat !== undefined ? p[mLat] : '') || '');
-        const lng = parseFloat((mLng !== undefined ? p[mLng] : '') || '');
-        const hasLL = isFinite(lat) && isFinite(lng) && lat !== 0 && lng !== 0;
+        let lat = parseFloat((mLat !== undefined ? p[mLat] : '') || '');
+        let lng = parseFloat((mLng !== undefined ? p[mLng] : '') || '');
+        let hasLL = isFinite(lat) && isFinite(lng) && lat !== 0 && lng !== 0;
+        let coordSource = hasLL ? 'msha' : 'none';
+        const ov = COORDS_OVERRIDE[id];
+        if (ov && isFinite(ov.lat) && isFinite(ov.lng)) { lat = ov.lat; lng = ov.lng; hasLL = true; coordSource = ov.source || 'override'; }
         const nm = mName !== undefined ? (p[mName] || '').trim() : '';
+        const portable = mPort !== undefined ? /^(y|1|t)/i.test((p[mPort] || '').trim()) : false;
         const coordOk = hasLL && inBbox(st, lat, lng);
         if (!hasLL) latMissing++;
         else if (coordOk) latPresent++;
-        else { latBadState++; if (badSamples.length < 30) badSamples.push({ id: id, name: nm, state: st, lat: lat, lng: lng }); }
+        else {
+          // Out of its registered state. For portables this is usually fine (the rig moved);
+          // the actionable errors are non-portable or off-continent (ocean/foreign).
+          latBadState++;
+          const actuallyIn = guessState(lat, lng);
+          if (!actuallyIn) latNoUSState++;
+          if (!portable) latBadNonPortable++;
+          if ((!portable || !actuallyIn) && badSamples.length < 40) {
+            badSamples.push({ id: id, name: nm, state: st, lat: lat, lng: lng, actuallyIn: actuallyIn, portable: portable });
+          }
+        }
         roster.push({
           id: id,
           name: nm,
@@ -365,9 +397,11 @@ async function buildData() {
           county: mCnty !== undefined ? (p[mCnty] || '').trim() : '',
           cd: mCd !== undefined ? (p[mCd] || '').trim() : '',
           district: dist,
+          portable: portable,
           lat: hasLL ? lat : null,
           lng: hasLL ? lng : null,
           coordOk: coordOk,
+          coordSource: coordSource,
           employees: mEmp !== undefined ? (parseInt((p[mEmp] || '0').trim(), 10) || 0) : 0
         });
       }
@@ -543,6 +577,9 @@ async function buildData() {
       latPresent: latPresent,
       latMissing: latMissing,
       latBadState: latBadState,
+      latBadNonPortable: latBadNonPortable,
+      latNoUSState: latNoUSState,
+      geocodeResidual: latMissing + latBadNonPortable + latNoUSState,
       badSamples: badSamples,
       productCounts: productCounts,
       statusCounts: statusCounts
