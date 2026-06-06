@@ -159,120 +159,292 @@ function streamZip(fileName, onHeader, onRow) {
   });
 }
 
+// ── Safety accumulators (run Metal/Non-Metal and aggregates-only in parallel) ──
+function newSafetyAcc() {
+  return {
+    fatalByYear: {}, injuryByYear: {}, causeBySubunit: {}, stateData: {},
+    injSeverity: {}, injCause: {}, injOp: { Facility: 0, Surface: 0, Underground: 0 }
+  };
+}
+function addAccidentRec(acc, rec, tenYrStart) {
+  const yr = rec.yr, deg = rec.deg, cls = rec.cls, st = rec.st;
+  if (deg === FATALITY_CODE) {
+    acc.fatalByYear[yr] = (acc.fatalByYear[yr] || 0) + 1;
+    if (st) (acc.stateData[st] = acc.stateData[st] || { fatalities: 0, injuries: 0 }).fatalities++;
+  }
+  if (INJURY_CODES[deg]) {
+    acc.injuryByYear[yr] = (acc.injuryByYear[yr] || 0) + 1;
+    if (st) (acc.stateData[st] = acc.stateData[st] || { fatalities: 0, injuries: 0 }).injuries++;
+  }
+  if (yr >= tenYrStart) {
+    if (deg === FATALITY_CODE) {
+      const c = acc.causeBySubunit[cls] || (acc.causeBySubunit[cls] = { Cause: cls, Fac: 0, Surf: 0, UG: 0 });
+      if (rec.isFacility) c.Fac++; else if (rec.isUG) c.UG++; else c.Surf++;
+    }
+    if (deg !== FATALITY_CODE && (INJURY_CODES[deg] || deg === '07')) {
+      const sev = DEGREE_LABELS[deg] || 'Other';
+      acc.injSeverity[sev] = (acc.injSeverity[sev] || 0) + 1;
+      acc.injCause[cls] = (acc.injCause[cls] || 0) + 1;
+      if (rec.isFacility) acc.injOp.Facility++; else if (rec.isUG) acc.injOp.Underground++; else acc.injOp.Surface++;
+    }
+  }
+}
+function finalizeSafety(acc, hoursByYear) {
+  const allFatalities = Object.keys(acc.fatalByYear).map(Number).sort((a, b) => a - b)
+    .map((yr) => ({ Year: yr, Fatalities: acc.fatalByYear[yr] }));
+  const tenYrCauses = Object.values(acc.causeBySubunit)
+    .map((c) => ({ Cause: c.Cause, Fac: c.Fac, Surf: c.Surf, UG: c.UG, Sum: c.Fac, Sum_1: c.Surf, Sum_2: c.UG, Total: c.Fac + c.Surf + c.UG }))
+    .sort((a, b) => b.Total - a.Total).slice(0, 15);
+  const injuryArr = Object.keys(acc.injuryByYear).map(Number).sort((a, b) => a - b)
+    .map((yr) => ({ Year: yr, Injuries: acc.injuryByYear[yr] }));
+  const injuryRate = injuryArr.map((row) => {
+    const hrs = hoursByYear[row.Year] || 0;
+    const rate = hrs > 0 ? Number(((row.Injuries / hrs) * 200000).toFixed(2)) : null;
+    return { Year: row.Year, Injuries: row.Injuries, Hours: Math.round(hrs), Rate: rate };
+  }).filter((r) => r.Rate !== null);
+  const stateByAbbr = {};
+  Object.keys(acc.stateData).forEach((fips) => {
+    const abbr = FIPS_TO_STATE[fips];
+    if (abbr) stateByAbbr[abbr] = acc.stateData[fips];
+  });
+  const injuries = {
+    byYear: Object.keys(acc.injuryByYear).map(Number).sort((a, b) => a - b)
+      .map((yr) => ({ Year: yr, Count: acc.injuryByYear[yr] })),
+    bySeverity: Object.keys(acc.injSeverity).map((k) => ({ label: k, count: acc.injSeverity[k] }))
+      .sort((a, b) => b.count - a.count),
+    byCause: Object.keys(acc.injCause).map((k) => ({ label: k, count: acc.injCause[k] }))
+      .sort((a, b) => b.count - a.count).slice(0, 10),
+    byOperation: Object.keys(acc.injOp).map((k) => ({ label: k, count: acc.injOp[k] }))
+      .filter((o) => o.count > 0)
+  };
+  return { allFatalities: allFatalities, tenYrCauses: tenYrCauses, injuryRate: injuryRate, stateData: stateByAbbr, injuries: injuries };
+}
+
+function newViolAcc() { return { cfrAgg: {}, citByStateYear: {}, citByDistrictYear: {}, violYears: {} }; }
+function addViolationRec(acc, rec, threeYrStart) {
+  const yr = rec.yr, info = rec.info;
+  if (info) {
+    if (info.st) {
+      (acc.citByStateYear[info.st] = acc.citByStateYear[info.st] || {});
+      acc.citByStateYear[info.st][yr] = (acc.citByStateYear[info.st][yr] || 0) + 1;
+      acc.violYears[yr] = true;
+    }
+    if (info.dist) {
+      (acc.citByDistrictYear[info.dist] = acc.citByDistrictYear[info.dist] || {});
+      acc.citByDistrictYear[info.dist][yr] = (acc.citByDistrictYear[info.dist][yr] || 0) + 1;
+    }
+  }
+  if (yr >= threeYrStart && rec.base) {
+    const a = acc.cfrAgg[rec.base] || (acc.cfrAgg[rec.base] = { count: 0, ss: 0 });
+    a.count++;
+    if (rec.ss) a.ss++;
+  }
+}
+function finalizeViol(acc, stateDistrict) {
+  const topViolations = Object.keys(acc.cfrAgg).map((sec) => {
+    const a = acc.cfrAgg[sec];
+    return {
+      section: sec, description: CFR_DESCR[sec] || ('30 CFR §' + sec),
+      count: a.count, ssCount: a.ss, typicallySS: a.ss > a.count / 2
+    };
+  }).sort((x, y) => y.count - x.count).slice(0, 15).map((v, i) => ({ section: v.section, description: v.description, count: v.count, ssCount: v.ssCount, typicallySS: v.typicallySS, rank: i + 1 }));
+  return {
+    topViolations: topViolations,
+    byStateYear: acc.citByStateYear,
+    byDistrictYear: acc.citByDistrictYear,
+    stateDistrict: stateDistrict,
+    years: Object.keys(acc.violYears).map(Number).sort((a, b) => a - b)
+  };
+}
+
 async function buildData() {
   const currentYear = new Date().getFullYear();
   const tenYrStart = currentYear - 10;
+  const threeYrStart = currentYear - 3;
 
-  const fatalByYear = {};
-  const injuryByYear = {};
-  const causeBySubunit = {};
-  const stateData = {};
-  const hoursByYear = {};
-  // Injuries-page breakdowns (non-fatal reportable injuries, last 10 yrs)
-  const injSeverity = {};
-  const injCause = {};
-  const injOp = { Facility: 0, Surface: 0, Underground: 0 };
-
-  // 1) Accidents.zip → fatalities, injuries, causes, state breakdown
-  await streamZip('Accidents.zip', null, (idx, p) => {
-    const cm = (p[idx['COAL_METAL_IND']] || '').trim();
-    if (cm !== 'M') return;
-    const yr = parseInt((p[idx['CAL_YR']] || '0').trim(), 10);
-    if (!yr) return;
-    const deg = (p[idx['DEGREE_INJURY_CD']] || '').trim();
-    const cls = (p[idx['CLASSIFICATION']] || 'Unknown').trim() || 'Unknown';
-    const sub = (p[idx['SUBUNIT']] || '').trim().toLowerCase();
-    const st = (p[idx['FIPS_STATE_CD']] || '').trim();
-
-    const isUG = sub.indexOf('underground') !== -1;
-    const isFacility = sub.indexOf('facility') !== -1 || sub.indexOf('mill') !== -1 || sub.indexOf('shop') !== -1 || sub.indexOf('office') !== -1;
-
-    if (deg === FATALITY_CODE) {
-      fatalByYear[yr] = (fatalByYear[yr] || 0) + 1;
-      if (st) { (stateData[st] = stateData[st] || { fatalities: 0, injuries: 0 }).fatalities++; }
-    }
-    if (INJURY_CODES[deg]) {
-      injuryByYear[yr] = (injuryByYear[yr] || 0) + 1;
-      if (st) { (stateData[st] = stateData[st] || { fatalities: 0, injuries: 0 }).injuries++; }
-    }
-
-    if (yr >= tenYrStart) {
-      // Fatalities-by-cause pies (fatalities only — these feed the Fatalities page)
-      if (deg === FATALITY_CODE) {
-        const c = causeBySubunit[cls] || (causeBySubunit[cls] = { Cause: cls, Fac: 0, Surf: 0, UG: 0 });
-        if (isFacility) c.Fac++; else if (isUG) c.UG++; else c.Surf++;
-      }
-      // Injury breakdowns (non-fatal reportable injuries — these feed the Injuries page)
-      if (deg !== FATALITY_CODE && (INJURY_CODES[deg] || deg === '07')) {
-        const sev = DEGREE_LABELS[deg] || 'Other';
-        injSeverity[sev] = (injSeverity[sev] || 0) + 1;
-        injCause[cls] = (injCause[cls] || 0) + 1;
-        if (isFacility) injOp.Facility++; else if (isUG) injOp.Underground++; else injOp.Surface++;
-      }
-    }
-  });
-
-  // 2) MinesProdYearly.zip → employee-hours by year (for injury rate)
+  // ── 1) Mines.zip FIRST — builds the location roster, the MINE_ID→{state,district}
+  //       join map (for citations), and the aggregate MINE_ID set (for safety). ──
+  const mineInfo = {};            // MINE_ID -> { st, dist } (ALL mines, for citation join)
+  const stateDistrictCount = {};  // st -> { dist -> count } (dominant district per state)
+  const aggMineIds = new Set();   // MINE_IDs with a construction-aggregate primary product (drives safety filter; product-only, ALL statuses)
+  const roster = [];              // location roster (status-filtered, aggregate + industrial sand)
+  const productCounts = {};       // raw PRIMARY_SIC -> count over roster [diagnostic]
+  const statusCounts = {};        // raw status -> count over all mines [diagnostic]
+  let latPresent = 0, latMissing = 0;
   try {
-    let hCm, hYr, hHrs;
-    await streamZip('MinesProdYearly.zip', (idx) => {
-      hCm = col(idx, ['COAL_METAL_IND']);
-      hYr = col(idx, ['CAL_YR', 'CALENDAR_YR', 'PROD_CAL_YR']);
-      hHrs = col(idx, ['ANNUAL_HRS', 'ANNUAL_HOURS', 'HRS_WORKED', 'EMPLOYEE_HRS', 'EMPLOYEE_HOURS', 'HOURS_WORKED']);
-    }, (_idx, p) => {
-      // Filter to Metal/Non-Metal only if that column exists in this file.
-      if (hCm !== undefined && (p[hCm] || '').trim() !== 'M') return;
-      if (hYr === undefined || hHrs === undefined) return;
-      const yr = parseInt((p[hYr] || '0').trim(), 10);
-      const hours = parseFloat((p[hHrs] || '0').trim());
-      if (!yr || !hours) return;
-      hoursByYear[yr] = (hoursByYear[yr] || 0) + hours;
-    });
-  } catch (e) {
-    console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
-  }
-
-  // 3a) Mines.zip → MINE_ID → { state, district } (Violations has no state/district column, so we join on MINE_ID)
-  const mineInfo = {};            // MINE_ID -> { st, dist }
-  const stateDistrictCount = {};  // st -> { dist -> count }  (to derive the dominant district per state)
-  try {
-    let mId, mSt, mDist;
+    let mId, mName, mBiz, mType, mStatus, mSt, mCnty, mCd, mDist, mProd, mSicCd, mLat, mLng, mEmp;
     await streamZip('Mines.zip', (idx) => {
       mId = col(idx, ['MINE_ID']);
+      mName = col(idx, ['CURRENT_MINE_NAME', 'MINE_NAME']);
+      mBiz = col(idx, ['CURRENT_OPERATOR_NAME', 'CURRENT_CONTROLLER_NAME', 'OPERATOR_NAME']);
+      mType = col(idx, ['CURRENT_MINE_TYPE', 'MINE_TYPE']);
+      mStatus = col(idx, ['CURRENT_MINE_STATUS', 'MINE_STATUS']);
       mSt = col(idx, ['STATE', 'STATE_ABBR', 'STATE_CD', 'MINE_STATE']);
+      mCnty = col(idx, ['FIPS_CNTY_NM', 'COUNTY', 'COUNTY_NM']);
+      mCd = col(idx, ['CONG_DIST_CD', 'CONGRESS_DIST', 'CONG_DIST']);
       mDist = col(idx, ['DISTRICT', 'MSHA_DISTRICT', 'DIST']);
+      mProd = col(idx, ['PRIMARY_SIC', 'PRIMARY_PRODUCT', 'PRIMARY_CANVASS']);
+      mSicCd = col(idx, ['PRIMARY_SIC_CD']);
+      mLat = col(idx, ['LATITUDE', 'LAT']);
+      mLng = col(idx, ['LONGITUDE', 'LONG', 'LON']);
+      mEmp = col(idx, ['NO_EMPLOYEES', 'CURRENT_NO_EMPLOYEES', 'EMPLOYEES']);
     }, (_idx, p) => {
-      if (mId === undefined || mSt === undefined) return;
+      if (mId === undefined) return;
       const id = (p[mId] || '').trim();
-      let st = (p[mSt] || '').trim().toUpperCase();
-      if (/^\d+$/.test(st)) st = FIPS_TO_STATE[st.padStart(2, '0')] || ''; // tolerate FIPS instead of abbr
+      if (!id) return;
+      let st = mSt !== undefined ? (p[mSt] || '').trim().toUpperCase() : '';
+      if (/^\d+$/.test(st)) st = FIPS_TO_STATE[st.padStart(2, '0')] || '';
       const dist = mDist !== undefined ? (p[mDist] || '').trim() : '';
-      if (id && st.length === 2) {
+      if (st.length === 2) {
         mineInfo[id] = { st: st, dist: dist };
         if (dist) {
           (stateDistrictCount[st] = stateDistrictCount[st] || {});
           stateDistrictCount[st][dist] = (stateDistrictCount[st][dist] || 0) + 1;
         }
       }
+
+      const product = mProd !== undefined ? (p[mProd] || '').trim() : '';
+      const seg = productSegment(product);
+      if (seg === 'construction_aggregate') aggMineIds.add(id);
+
+      const status = mStatus !== undefined ? (p[mStatus] || '').trim() : '';
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+      const rs = rosterStatus(status);
+      // Roster = aggregate OR industrial sand, in one of the kept statuses.
+      if (rs && seg) {
+        productCounts[product] = (productCounts[product] || 0) + 1;
+        const lat = parseFloat((mLat !== undefined ? p[mLat] : '') || '');
+        const lng = parseFloat((mLng !== undefined ? p[mLng] : '') || '');
+        const hasLL = isFinite(lat) && isFinite(lng) && lat !== 0 && lng !== 0;
+        if (hasLL) latPresent++; else latMissing++;
+        roster.push({
+          id: id,
+          name: mName !== undefined ? (p[mName] || '').trim() : '',
+          business: mBiz !== undefined ? (p[mBiz] || '').trim() : '',
+          type: mType !== undefined ? (p[mType] || '').trim() : '',
+          status: rs,
+          product: product,
+          segment: seg,
+          sicCd: mSicCd !== undefined ? (p[mSicCd] || '').trim() : '',
+          state: st,
+          county: mCnty !== undefined ? (p[mCnty] || '').trim() : '',
+          cd: mCd !== undefined ? (p[mCd] || '').trim() : '',
+          district: dist,
+          lat: hasLL ? lat : null,
+          lng: hasLL ? lng : null,
+          employees: mEmp !== undefined ? (parseInt((p[mEmp] || '0').trim(), 10) || 0) : 0
+        });
+      }
     });
   } catch (e) {
-    console.warn('Mines failed (citation state map unavailable):', e.message);
+    console.warn('Mines failed:', e.message);
   }
-  // Dominant MSHA district per state (for coloring/labeling the citation map)
   const stateDistrict = {};
   Object.keys(stateDistrictCount).forEach((st) => {
     const m = stateDistrictCount[st];
     stateDistrict[st] = Object.keys(m).sort((a, b) => m[b] - m[a])[0];
   });
 
-  // 3b) Violations.zip → top CFR sections (last 3 yrs) + citations by state/district & year (joined via Mines)
-  const citByStateYear = {};    // { stateAbbr: { year: count } }
-  const citByDistrictYear = {}; // { district: { year: count } }
-  const cfrAgg = {};            // { baseSection: { count, ss } } — last 3 yrs
-  const violYears = {};         // set of years seen
+  // ── 2) AddressOfRecord.zip → street address for roster mines (join on MINE_ID) ──
+  try {
+    const rosterIds = new Set(roster.map((r) => r.id));
+    const addrById = {};
+    let aId, aStreet, aPo, aCity, aState, aZip;
+    await streamZip('AddressOfRecord.zip', (idx) => {
+      aId = col(idx, ['MINE_ID']);
+      aStreet = col(idx, ['STREET', 'STREET_ADDRESS', 'ADDRESS']);
+      aPo = col(idx, ['PO_BOX']);
+      aCity = col(idx, ['CITY']);
+      aState = col(idx, ['STATE_ABBR', 'STATE']);
+      aZip = col(idx, ['ZIP_CD', 'ZIP', 'POSTAL_CD']);
+    }, (_idx, p) => {
+      if (aId === undefined) return;
+      const id = (p[aId] || '').trim();
+      if (!rosterIds.has(id)) return;
+      addrById[id] = {
+        street: aStreet !== undefined ? (p[aStreet] || '').trim() : '',
+        po: aPo !== undefined ? (p[aPo] || '').trim() : '',
+        city: aCity !== undefined ? (p[aCity] || '').trim() : '',
+        state: aState !== undefined ? (p[aState] || '').trim() : '',
+        zip: aZip !== undefined ? (p[aZip] || '').trim() : ''
+      };
+    });
+    roster.forEach((r) => {
+      const a = addrById[r.id];
+      if (a) {
+        const line1 = a.street || a.po;
+        const cityState = [a.city, a.state].filter(Boolean).join(', ');
+        r.address = [line1, cityState, a.zip].filter(Boolean).join(' ').trim();
+        r.city = a.city; r.zip = a.zip;
+      } else { r.address = ''; r.city = ''; r.zip = ''; }
+    });
+  } catch (e) {
+    console.warn('AddressOfRecord failed:', e.message);
+    roster.forEach((r) => { r.address = ''; r.city = ''; r.zip = ''; });
+  }
+
+  // Operations + employment by state (derived from roster)
+  const operationsByState = {};
+  const employmentByState = {};
+  roster.forEach((r) => {
+    const o = operationsByState[r.state] || (operationsByState[r.state] = { crushedStone: 0, sandGravel: 0, industrialSand: 0, total: 0 });
+    const pk = normKey(r.product);
+    if (r.segment === 'industrial_sand') o.industrialSand++;
+    else if (pk.indexOf('sand') !== -1 || pk.indexOf('gravel') !== -1) o.sandGravel++;
+    else o.crushedStone++;
+    o.total++;
+    employmentByState[r.state] = (employmentByState[r.state] || 0) + (r.employees || 0);
+  });
+
+  // ── 3) Accidents.zip → Metal/Non-Metal AND aggregates-only safety ──
+  const mnm = newSafetyAcc(), agg = newSafetyAcc();
+  await streamZip('Accidents.zip', null, (idx, p) => {
+    const cm = (p[idx['COAL_METAL_IND']] || '').trim();
+    const id = (p[idx['MINE_ID']] || '').trim();
+    const isAgg = id && aggMineIds.has(id);
+    if (cm !== 'M' && !isAgg) return;
+    const yr = parseInt((p[idx['CAL_YR']] || '0').trim(), 10);
+    if (!yr) return;
+    const sub = (p[idx['SUBUNIT']] || '').trim().toLowerCase();
+    const rec = {
+      yr: yr,
+      deg: (p[idx['DEGREE_INJURY_CD']] || '').trim(),
+      cls: (p[idx['CLASSIFICATION']] || 'Unknown').trim() || 'Unknown',
+      st: (p[idx['FIPS_STATE_CD']] || '').trim(),
+      isUG: sub.indexOf('underground') !== -1,
+      isFacility: sub.indexOf('facility') !== -1 || sub.indexOf('mill') !== -1 || sub.indexOf('shop') !== -1 || sub.indexOf('office') !== -1
+    };
+    if (cm === 'M') addAccidentRec(mnm, rec, tenYrStart);
+    if (isAgg) addAccidentRec(agg, rec, tenYrStart);
+  });
+
+  // ── 4) MinesProdYearly.zip → employee-hours by year (M/NM + aggregates, joined on MINE_ID) ──
+  const mnmHours = {}, aggHours = {};
+  try {
+    let hCm, hYr, hHrs, hId;
+    await streamZip('MinesProdYearly.zip', (idx) => {
+      hCm = col(idx, ['C_M_IND', 'COAL_METAL_IND']);
+      hYr = col(idx, ['CALENDAR_YR', 'CAL_YR', 'PROD_CAL_YR']);
+      hHrs = col(idx, ['ANNUAL_HRS', 'ANNUAL_HOURS', 'HRS_WORKED', 'EMPLOYEE_HRS', 'EMPLOYEE_HOURS', 'HOURS_WORKED']);
+      hId = col(idx, ['MINE_ID']);
+    }, (_idx, p) => {
+      if (hYr === undefined || hHrs === undefined) return;
+      const yr = parseInt((p[hYr] || '0').trim(), 10);
+      const hours = parseFloat((p[hHrs] || '0').trim());
+      if (!yr || !hours) return;
+      const cm = hCm !== undefined ? (p[hCm] || '').trim() : '';
+      if (cm === 'M') mnmHours[yr] = (mnmHours[yr] || 0) + hours;
+      const id = hId !== undefined ? (p[hId] || '').trim() : '';
+      if (id && aggMineIds.has(id)) aggHours[yr] = (aggHours[yr] || 0) + hours;
+    });
+  } catch (e) {
+    console.warn('MinesProdYearly failed (injury rate unavailable):', e.message);
+  }
+
+  // ── 5) Violations.zip → top CFR + citations, M/NM AND aggregates-only ──
+  const mnmViol = newViolAcc(), aggViol = newViolAcc();
   try {
     let vCm, vYr, vCfr, vSS, vMine;
-    const threeYrStart = currentYear - 3;
     await streamZip('Violations.zip', (idx) => {
       vCm = col(idx, ['COAL_METAL_IND']);
       vYr = col(idx, ['CAL_YR', 'VIOLATION_ISSUE_YR']);
@@ -280,97 +452,63 @@ async function buildData() {
       vSS = col(idx, ['SIG_SUB', 'SIG_AND_SUB', 'S_AND_S']);
       vMine = col(idx, ['MINE_ID']);
     }, (_idx, p) => {
-      if (vCm !== undefined && (p[vCm] || '').trim() !== 'M') return;
       if (vYr === undefined) return;
       const yr = parseInt((p[vYr] || '0').trim(), 10);
       if (!yr) return;
-      // citations by state/district & year (join MINE_ID → Mines) — full range for the slider
-      const info = vMine !== undefined && mineInfo[(p[vMine] || '').trim()];
-      if (info) {
-        if (info.st) {
-          (citByStateYear[info.st] = citByStateYear[info.st] || {});
-          citByStateYear[info.st][yr] = (citByStateYear[info.st][yr] || 0) + 1;
-          violYears[yr] = true;
-        }
-        if (info.dist) {
-          (citByDistrictYear[info.dist] = citByDistrictYear[info.dist] || {});
-          citByDistrictYear[info.dist][yr] = (citByDistrictYear[info.dist][yr] || 0) + 1;
-        }
-      }
-      // top CFR sections — last 3 yrs only, normalized to base section (56.14107(a) → 56.14107)
+      const cm = vCm !== undefined ? (p[vCm] || '').trim() : '';
+      const id = vMine !== undefined ? (p[vMine] || '').trim() : '';
+      const isAgg = id && aggMineIds.has(id);
+      if (cm !== 'M' && !isAgg) return;
+      let base = null;
       if (yr >= threeYrStart && vCfr !== undefined) {
         const m = (p[vCfr] || '').trim().match(/^\d+\.\d+/);
-        if (m) {
-          const base = m[0];
-          const a = cfrAgg[base] || (cfrAgg[base] = { count: 0, ss: 0 });
-          a.count++;
-          if (vSS !== undefined && (p[vSS] || '').trim().toUpperCase() === 'Y') a.ss++;
-        }
+        if (m) base = m[0];
       }
+      const rec = {
+        yr: yr,
+        base: base,
+        ss: vSS !== undefined && (p[vSS] || '').trim().toUpperCase() === 'Y',
+        info: mineInfo[id] || null
+      };
+      if (cm === 'M') addViolationRec(mnmViol, rec, threeYrStart);
+      if (isAgg) addViolationRec(aggViol, rec, threeYrStart);
     });
   } catch (e) {
     console.warn('Violations failed (citations unavailable):', e.message);
   }
 
-  const allFatalities = Object.keys(fatalByYear).map(Number).sort((a, b) => a - b)
-    .map((yr) => ({ Year: yr, Fatalities: fatalByYear[yr] }));
-
-  const injuryArr = Object.keys(injuryByYear).map(Number).sort((a, b) => a - b)
-    .map((yr) => ({ Year: yr, Injuries: injuryByYear[yr] }));
-
-  const tenYrCauses = Object.values(causeBySubunit)
-    .map((c) => ({ ...c, Sum: c.Fac, Sum_1: c.Surf, Sum_2: c.UG, Total: c.Fac + c.Surf + c.UG }))
-    .sort((a, b) => b.Total - a.Total)
-    .slice(0, 15);
-
-  const injuryRate = injuryArr.map((row) => {
-    const hrs = hoursByYear[row.Year] || 0;
-    const rate = hrs > 0 ? Number(((row.Injuries / hrs) * 200000).toFixed(2)) : null;
-    return { Year: row.Year, Injuries: row.Injuries, Hours: Math.round(hrs), Rate: rate };
-  }).filter((r) => r.Rate !== null);
-
-  const stateByAbbr = {};
-  Object.keys(stateData).forEach((fips) => {
-    const abbr = FIPS_TO_STATE[fips];
-    if (abbr) stateByAbbr[abbr] = stateData[fips];
-  });
-
-  // Injuries-page payload
-  const injuries = {
-    byYear: Object.keys(injuryByYear).map(Number).sort((a, b) => a - b)
-      .map((yr) => ({ Year: yr, Count: injuryByYear[yr] })),
-    bySeverity: Object.keys(injSeverity).map((k) => ({ label: k, count: injSeverity[k] }))
-      .sort((a, b) => b.count - a.count),
-    byCause: Object.keys(injCause).map((k) => ({ label: k, count: injCause[k] }))
-      .sort((a, b) => b.count - a.count).slice(0, 10),
-    byOperation: Object.keys(injOp).map((k) => ({ label: k, count: injOp[k] }))
-      .filter((o) => o.count > 0)
-  };
-
-  // Citations-page payload (cfrAgg keys are already base sections; citByStateYear already abbr-keyed)
-  const topViolations = Object.keys(cfrAgg).map((sec) => {
-    const a = cfrAgg[sec];
-    return {
-      section: sec,
-      description: CFR_DESCR[sec] || ('30 CFR §' + sec),
-      count: a.count,
-      ssCount: a.ss,
-      typicallySS: a.ss > a.count / 2
-    };
-  }).sort((x, y) => y.count - x.count).slice(0, 15).map((v, i) => ({ ...v, rank: i + 1 }));
-
-  const violations = {
-    topViolations,
-    byStateYear: citByStateYear,
-    byDistrictYear: citByDistrictYear,
-    stateDistrict: stateDistrict,
-    years: Object.keys(violYears).map(Number).sort((a, b) => a - b)
-  };
+  const mnmFinal = finalizeSafety(mnm, mnmHours);
+  const aggFinal = finalizeSafety(agg, aggHours);
 
   return {
-    allFatalities, tenYrCauses, injuryRate,
-    stateData: stateByAbbr,
-    injuries, violations,
+    // Top-level = Metal/Non-Metal (UNCHANGED shape — the deployed dashboard keeps working).
+    allFatalities: mnmFinal.allFatalities,
+    tenYrCauses: mnmFinal.tenYrCauses,
+    injuryRate: mnmFinal.injuryRate,
+    stateData: mnmFinal.stateData,
+    injuries: mnmFinal.injuries,
+    violations: finalizeViol(mnmViol, stateDistrict),
+    // Aggregates-only parallel view (construction aggregates; industrial sand excluded).
+    aggregates: {
+      allFatalities: aggFinal.allFatalities,
+      tenYrCauses: aggFinal.tenYrCauses,
+      injuryRate: aggFinal.injuryRate,
+      stateData: aggFinal.stateData,
+      injuries: aggFinal.injuries,
+      violations: finalizeViol(aggViol, stateDistrict)
+    },
+    // Location roster + derived counts (served via /mines, not /).
+    roster: roster,
+    operationsByState: operationsByState,
+    employmentByState: employmentByState,
+    diagnostics: {
+      rosterCount: roster.length,
+      aggMineIdCount: aggMineIds.size,
+      latPresent: latPresent,
+      latMissing: latMissing,
+      productCounts: productCounts,
+      statusCounts: statusCounts
+    },
     lastUpdated: new Date().toISOString()
   };
 }
@@ -380,6 +518,29 @@ let CACHE = null;
 let CACHE_TS = 0;
 const CACHE_MS = 6 * 60 * 60 * 1000;
 
+async function getData(fresh) {
+  if (!fresh && CACHE && (Date.now() - CACHE_TS) < CACHE_MS) return CACHE;
+  const data = await buildData();
+  CACHE = data; CACHE_TS = Date.now();
+  return data;
+}
+
+// Safety payload (small) — the Safety tab reads this. Excludes the big roster.
+function safetySlice(d) {
+  return {
+    allFatalities: d.allFatalities, tenYrCauses: d.tenYrCauses, injuryRate: d.injuryRate,
+    stateData: d.stateData, injuries: d.injuries, violations: d.violations,
+    aggregates: d.aggregates, lastUpdated: d.lastUpdated
+  };
+}
+// Location payload (large) — the roster sheet writer reads this. Excludes safety detail.
+function minesSlice(d) {
+  return {
+    roster: d.roster, operationsByState: d.operationsByState, employmentByState: d.employmentByState,
+    diagnostics: d.diagnostics, lastUpdated: d.lastUpdated
+  };
+}
+
 const app = express();
 
 app.get('/', async (req, res) => {
@@ -388,16 +549,36 @@ app.get('/', async (req, res) => {
     return;
   }
   try {
-    const fresh = req.query.fresh === '1';
-    if (!fresh && CACHE && (Date.now() - CACHE_TS) < CACHE_MS) {
-      res.json({ ...CACHE, cached: true });
-      return;
-    }
-    const data = await buildData();
-    CACHE = data; CACHE_TS = Date.now();
-    res.json(data);
+    const d = await getData(req.query.fresh === '1');
+    res.json(safetySlice(d));
   } catch (e) {
     console.error('build error:', e);
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Location roster + operations/employment + diagnostics.
+app.get('/mines', async (req, res) => {
+  if (SECRET && req.query.token !== SECRET) {
+    res.status(401).json({ error: 'Invalid or missing token' });
+    return;
+  }
+  try {
+    const d = await getData(req.query.fresh === '1');
+    res.json(minesSlice(d));
+  } catch (e) {
+    console.error('build error:', e);
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Diagnostics only — small, fast to eyeball after a build (does NOT force a rebuild).
+app.get('/diag', async (req, res) => {
+  if (SECRET && req.query.token !== SECRET) { res.status(401).json({ error: 'Invalid or missing token' }); return; }
+  try {
+    const d = await getData(req.query.fresh === '1');
+    res.json({ diagnostics: d.diagnostics, lastUpdated: d.lastUpdated });
+  } catch (e) {
     res.status(500).json({ error: String(e && e.message || e) });
   }
 });
