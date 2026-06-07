@@ -575,7 +575,8 @@ async function buildData() {
     await streamZip('Violations.zip', (idx) => {
       vCm = col(idx, ['COAL_METAL_IND']);
       vYr = col(idx, ['CAL_YR', 'VIOLATION_ISSUE_YR']);
-      vCfr = col(idx, ['SECTION_OF_ACT', 'PART_SECTION', 'CFR_STANDARD']);
+      // PART_SECTION holds the 30 CFR standard (e.g. "56.14132(a)"); SECTION_OF_ACT is the Mine Act section (often blank).
+      vCfr = col(idx, ['PART_SECTION', 'SECTION_OF_ACT', 'CFR_STANDARD']);
       vSS = col(idx, ['SIG_SUB', 'SIG_AND_SUB', 'S_AND_S']);
       vMine = col(idx, ['MINE_ID']);
     }, (_idx, p) => {
