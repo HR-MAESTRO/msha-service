@@ -108,6 +108,20 @@ const PRODUCT_SEGMENT = {
 function normKey(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
 function productSegment(s) { return PRODUCT_SEGMENT[normKey(s)] || null; }
 
+// Membership/prospect rollup needs finer granularity than the safety segment: slate &
+// mica count as construction-aggregate for safety but are NOT marketable construction
+// aggregates, so they are DROPPED from prospects; industrial sand is tracked as its own
+// category (separate from aggregates). Returns 'aggregate' | 'industrialSand' | null.
+const MEMBERSHIP_DROP = new Set(['crushed, broken slate', 'crushed, broken mica']);
+function membershipSegment(product) {
+  const k = normKey(product);
+  if (MEMBERSHIP_DROP.has(k)) return null;
+  const seg = PRODUCT_SEGMENT[k];
+  if (seg === 'construction_aggregate') return 'aggregate';
+  if (seg === 'industrial_sand') return 'industrialSand';
+  return null;
+}
+
 // MSHA statuses kept in the location roster (the "all listed" set the user wants).
 // Abandoned / Closed-By-MSHA are excluded. Matched on a punctuation/space-stripped
 // lowercase key to tolerate spelling variants (e.g. "Non-Producing" vs "NonProducing").
@@ -364,12 +378,14 @@ async function buildData() {
 
       const product = mProd !== undefined ? (p[mProd] || '').trim() : '';
       const seg = productSegment(product);
-      if (seg === 'construction_aggregate') {
-        aggMineIds.add(id);
-        // Membership/production rollup: parent (controller) + commodity + state, all statuses.
+      if (seg === 'construction_aggregate') aggMineIds.add(id);  // safety filter — unchanged (slate/mica stay aggregates here)
+      // Membership/production rollup (separate from the safety segment): real aggregates get
+      // a USGS commodity bucket; industrial sand is its own category; slate & mica are dropped.
+      const mseg = membershipSegment(product);
+      if (mseg && st.length === 2) {
         const ctrl = (mCtrl !== undefined ? (p[mCtrl] || '').trim() : '') ||
           (mBiz !== undefined ? (p[mBiz] || '').trim() : '') || '(Unknown controller)';
-        if (st.length === 2) prodInfo[id] = { ctrl: ctrl, comm: commodityOf(product), st: st };
+        prodInfo[id] = { ctrl: ctrl, comm: mseg === 'aggregate' ? commodityOf(product) : 'industrialSand', st: st, seg: mseg };
       }
 
       const status = mStatus !== undefined ? (p[mStatus] || '').trim() : '';
@@ -537,8 +553,9 @@ async function buildData() {
   // ── Production/membership rollup: parent (controller) employee-hours by state × commodity. ──
   // Allocator only — the dashboard combines these shares with USGS State_Data $ to estimate sales.
   // Each mine contributes its most-recent available year's hours (within the recent window).
-  const controllerAgg = {};   // ctrlKey -> { name, mineCount, states:{}, hbsc:{ st:{crushedStone,sandGravel} } }
+  const controllerAgg = {};   // aggregate parents: ctrlKey -> { name, mineCount, states:{}, hbsc:{ st:{crushedStone,sandGravel} } }
   const stateCommHours = {};  // st -> { crushedStone, sandGravel } (denominators for share allocation)
+  const isAgg = {};           // industrial-sand parents: ctrlKey -> { name, mineCount, states:{}, hours } (ranked by hours; no USGS $)
   let prodYearMax = 0;
   Object.keys(prodInfo).forEach((id) => {
     const info = prodInfo[id];
@@ -549,6 +566,11 @@ async function buildData() {
       if (yrs.length) { hrs = hrsObj[yrs[0]]; if (yrs[0] > prodYearMax) prodYearMax = yrs[0]; }
     }
     const key = info.ctrl.toUpperCase();
+    if (info.seg === 'industrialSand') {
+      const ic = isAgg[key] || (isAgg[key] = { name: info.ctrl, mineCount: 0, states: {}, hours: 0 });
+      ic.mineCount++; ic.states[info.st] = true; if (hrs > 0) ic.hours += hrs;
+      return;
+    }
     const c = controllerAgg[key] || (controllerAgg[key] = { name: info.ctrl, mineCount: 0, states: {}, hbsc: {} });
     c.mineCount++;
     c.states[info.st] = true;
@@ -565,6 +587,11 @@ async function buildData() {
     controllers: Object.keys(controllerAgg).map((k) => {
       const c = controllerAgg[k];
       return { controller: c.name, mineCount: c.mineCount, states: Object.keys(c.states), hoursByStateComm: c.hbsc };
+    }),
+    // Industrial-sand parents — separate category (no USGS value to estimate sales; ranked by employee-hours).
+    industrialSandControllers: Object.keys(isAgg).map((k) => {
+      const c = isAgg[k];
+      return { controller: c.name, mineCount: c.mineCount, states: Object.keys(c.states), hours: Math.round(c.hours) };
     })
   };
 
